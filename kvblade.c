@@ -13,6 +13,7 @@
 #include <linux/ata.h>
 #include <linux/ctype.h>
 #include <linux/kern_levels.h>
+#include <linux/tree.h>
 #include "if_aoe.h"
 #include "clydeinterface.h"
 
@@ -35,13 +36,6 @@ typedef enum {
 enum {
 	ATA_MODEL_LEN =	40,
 	ATA_LBA28MAX = 0x0fffffff,
-};
-
-enum {
-    TERR = 1,
-    TERR_ALLOC_FAILED,
-    TERR_NO_SUCH_ELEMENT,
-    TERR_BUSY,
 };
 
 struct aoedev;
@@ -753,98 +747,18 @@ static __always_inline char *treecmd_name(unsigned char cmd)
     }
 }
 
-#if 0
-static __always_inline void print_tree_frame(struct aoe_hdr *ah, struct aoe_datahdr *dh)
-{
-    int *data =NULL;
-    printk("cmd: %s\n", treecmd_name(ah->cmd));
-    printk("\ttid: %llu\n", dh->tree.tid);
-    printk("\tnid: %llu\n", dh->tree.nid);
-    printk("\toffset: %llu\n", dh->tree.off);
-    printk("\tlen: %llu\n", dh->tree.len);
-
-    if (dh->data != NULL) {
-        printk("\tDATA FOUND\n");
-        data = (int*) dh->data;
-        printk("data: %0x | %u \n", *data, *data);
-    } else {
-        printk("\tNO DATA\n");
-    }
-}
-#endif
-
-#if 0
-/** 
- * Writes data to the data portion of the outgoing packet. 
- * @description writes data to the data portion of the outgoing 
- *              packet, adjusting its size as it finishes.
- * @param skb the socket buffer of the packet 
- * @param dh points to the offset within skb where the aoe data 
- *           header starts
- * @param errcode the errorcode of the tree cmd 
- * @param buffer_len the length of the supplied buffer
- * @param buffer the start of the buffer 
- */
-static __always_inline void treecmd_write_skb_data(struct sk_buff *skb, struct aoe_datahdr *dh, int errcode, u64 buffer_len, void *buffer)
-{
-    ulong offset;
-    struct page *page;
-    u8 *skb_data = (u8*)skb->data;
-    #if 0
-    rq->bio = bio;
-		rq->d = d;
-
-		bio->bi_sector = lba;
-		bio->bi_bdev = d->blkdev;
-		bio->bi_end_io = ata_io_complete;
-		bio->bi_private = rq;
-
-		page = virt_to_page(dh->data);
-		bcnt = dh->ata.scnt << 9;
-		offset = offset_in_page(dh->data);
-
-		if (bio_add_page(bio, page, bcnt, offset) < bcnt) {
-			printk(KERN_ERR "Can't bio_add_page for %d sectors\n", dh->ata.scnt);
-			bio_put(bio);
-			goto drop;
-		}
-
-		rq->skb = skb;
-    #endif
-
-    
-    /*first, write the error code*/
-    memcpy(skb->data, &errcode, sizeof(int));
-    skb_data += sizeof(int);
-
-    page = virt_to_page(skb_data);
-    offset = offset_in_page(skb_data);
-    
-    skb->len = sizeof(int) + len;
-}
-#endif
-
 static __always_inline void set_errcode(struct aoe_datahdr *dh, int errcode)
 {
     memcpy(dh->data, &errcode, sizeof(int));
 }
 
-static __always_inline u32 translate_err_code(int errcode)
-{
-    switch(errcode) {
-    case -ENOENT:
-        return TERR_NO_SUCH_ELEMENT;
-    case -ENOMEM:
-        return TERR_ALLOC_FAILED;
-    default:
-        break;
-    }
-    return TERR;
-}
-
 static void __dbg_print_treecmd(frame_direction_t dir, struct aoe_hdr *ah, struct aoe_datahdr *dh)
 {
-    printk("%s cmd(%u),tid(%llu),nid(%llu),off(%llu),len(%llu) ", (dir == INCOMING ? "=>" : "<="), ah->cmd, dh->tree.tid, dh->tree.nid, dh->tree.off, dh->tree.len);
+    printk(
+        "%s cmd(%u),tid(%llu),nid(%llu),off(%llu),len(%llu),err(%u) ", 
+        (dir == INCOMING ? "=>" : "<="), ah->cmd, dh->tree.tid, dh->tree.nid, 
+        dh->tree.off, dh->tree.len, dh->tree.err
+    );
     if (ah->cmd == AOECMD_UPDATENODE && dir == INCOMING) {
         printk("[%s]\n", dh->data);
     } else if (ah->cmd == AOECMD_READNODE && dir == OUTGOING) {
@@ -858,7 +772,6 @@ static struct sk_buff *treecmd(struct aoedev *d, struct sk_buff *skb)
     struct aoe_hdr *ah;
     struct aoe_datahdr *dh;
     u64 tree_ret;
-    int retval;
 
     ah = (struct aoe_hdr *) skb_mac_header(skb);
 	dh = (struct aoe_datahdr *) ah->data;
@@ -878,42 +791,29 @@ static struct sk_buff *treecmd(struct aoedev *d, struct sk_buff *skb)
         skb_trim(skb, sizeof(*ah) + sizeof(*dh));
         break;
     case AOECMD_REMOVETREE:
-        retval = clydefscore_tree_remove(dh->tree.tid);
-        if (retval) { /*error*/
-            dh->tree.err = (retval == -ENOENT ? TERR_NO_SUCH_ELEMENT : TERR_BUSY);
-        }
+        dh->tree.err = clydefscore_tree_remove(dh->tree.tid);
         skb_trim(skb, sizeof(*ah) + sizeof(*dh));
         break;
     case AOECMD_UPDATENODE:
-        retval = clydefscore_node_write(dh->tree.tid, dh->tree.nid, dh->tree.off, dh->tree.len, dh->data);
-        if(unlikely(retval)) { /*error*/
-            dh->tree.err = translate_err_code(retval);
-        }
+        dh->tree.err = clydefscore_node_write(dh->tree.tid, dh->tree.nid, dh->tree.off, dh->tree.len, dh->data);
         skb_trim(skb, sizeof(*ah)+sizeof(*dh));
         break;
     case AOECMD_INSERTNODE:
-        retval = clydefscore_node_insert(dh->tree.tid, &dh->tree.nid);
-        if (unlikely(retval)) { /* error */
-            dh->tree.err = translate_err_code(retval);
-        }
+        dh->tree.err = clydefscore_node_insert(dh->tree.tid, &dh->tree.nid);
         skb_trim(skb, sizeof(*ah) + sizeof(*dh));
         break;
     case AOECMD_READNODE:
-        retval = clydefscore_node_read(dh->tree.tid, dh->tree.nid, dh->tree.off, dh->tree.len, dh->data);
-        if(unlikely(retval)) {
-            dh->tree.err = translate_err_code(retval);
-            skb_trim(skb, sizeof(*ah) + sizeof(*dh));
+        dh->tree.err = clydefscore_node_read(dh->tree.tid, dh->tree.nid, dh->tree.off, dh->tree.len, dh->data);
+        if (unlikely(dh->tree.err)) {
+            skb_trim(skb, sizeof(*ah) + sizeof(*dh)); /*no additional data on error*/
         } else {
-            /*FIXME dh->tree.len -- cannot use u64 across our ethernet interface 
+            /*dh->tree.len -- cannot use u64 across our ethernet interface 
               anyway, but it's technically breaking the interface*/
-            skb_trim(skb, sizeof(*ah) + sizeof(*dh) + (dh->tree.len & 0xFFFFFFFF));        
+            skb_trim(skb, sizeof(*ah) + sizeof(*dh) + (dh->tree.len & 0xFFFFFFFF));
         }
         break;
     case AOECMD_REMOVENODE:
-        retval = clydefscore_node_remove(dh->tree.tid, dh->tree.nid);
-        if (unlikely(retval)) { /* error */
-            dh->tree.err = (retval == -ENOENT ? TERR_NO_SUCH_ELEMENT : TERR);
-        }
+        dh->tree.err = clydefscore_node_remove(dh->tree.tid, dh->tree.nid);
         skb_trim(skb, sizeof(*ah) + sizeof(*dh));
         break;
     default:
