@@ -17,28 +17,81 @@
 #include "if_aoe.h"
 #include "clydeinterface.h"
 
+typedef enum {
+    INCOMING = 1,
+    OUTGOING,
+} frame_direction_t;
+struct aoedev;
+
 #define xprintk(L, fmt, arg...) printk(L "kvblade: " "%s: " fmt, __func__, ## arg)
 #define iprintk(fmt, arg...) xprintk(KERN_INFO, fmt, ## arg)
 #define eprintk(fmt, arg...) xprintk(KERN_ERR, fmt, ## arg)
 #define wprintk(fmt, arg...) xprintk(KERN_WARN, fmt, ## arg)
 #define dprintk(fmt, arg...) if(0);else xprintk(KERN_DEBUG, fmt, ## arg)
 
+//#define DEBUGGING 0
+
+#ifdef DEBUGGING
+	static __always_inline char *treecmd_name(unsigned char cmd)
+	{
+	    switch (cmd) {
+	    case AOECMD_CREATETREE:
+	        return "AOECMD_CREATETREE";
+	    case AOECMD_REMOVETREE:
+	        return "AOECMD_REMOVETREE";
+	    case AOECMD_READNODE:
+	        return "AOECMD_READNODE";
+	    case AOECMD_INSERTNODE:
+	        return "AOECMD_INSERTNODE";
+	    case AOECMD_UPDATENODE:
+	        return "AOECMD_UPDATENODE";
+	    case AOECMD_REMOVENODE:
+	        return "AOECMD_REMOVENODE";
+	    default:
+	        return "UNKNOWN_TREE_CMD";
+	    }
+	}
+
+	static void __dbg_print_treecmd(frame_direction_t dir, struct aoe_hdr *ah, struct aoe_datahdr *dh)
+	{
+	    pdbg(
+	        "%s cmd(%u),tid(%llu),nid(%llu),off(%llu),len(%llu),err(%u) ", 
+	        (dir == INCOMING ? "=>" : "<="), ah->cmd, dh->tree.tid, dh->tree.nid, 
+	        dh->tree.off, dh->tree.len, dh->tree.err
+	    );
+	    if (ah->cmd == AOECMD_UPDATENODE && dir == INCOMING) {
+	        printk("[%llu]\n", *((u64*)dh->data));
+	    } else if (ah->cmd == AOECMD_READNODE && dir == OUTGOING) {
+	        printk("[%llu]\n", *((u64*)dh->data));
+	    } else {
+	        printk("\n");
+	    }
+	}
+
+	#define pdbg(fmt, arg...) xprintk(KERN_INFO, fmt, ## arg)
+#else
+	static __always_inline char *treecmd_name(unsigned char cmd) {
+		return "";
+	}
+
+	static void __dbg_print_treecmd(frame_direction_t dir, struct aoe_hdr *ah, struct aoe_datahdr *dh)
+	{}
+
+	#define pdbg(fmt, arg...) {}
+#endif
+
 #define nelem(A) (sizeof (A) / sizeof (A)[0])
 #define MAXSECTORS(mtu) (((mtu) - sizeof (struct aoe_hdr) - sizeof (struct aoe_datahdr)) / 512)
 
 static struct kobject kvblade_kobj;
 
-typedef enum {
-    INCOMING = 1,
-    OUTGOING,
-} frame_direction_t;
+
 
 enum {
 	ATA_MODEL_LEN =	40,
 	ATA_LBA28MAX = 0x0fffffff,
 };
 
-struct aoedev;
 struct aoereq {
 	struct bio *bio;
 	struct sk_buff *skb;
@@ -550,7 +603,7 @@ static void ata_io_complete(struct bio *bio, int error)
 		dh->ata.errfeat = 0;
 		// should increment lba here, too
 	} else {
-		printk(KERN_ERR "I/O error %d on %s\n", error, d->kobj.name);
+		dprintk(KERN_ERR "I/O error %d on %s\n", error, d->kobj.name);
 		dh->ata.cmdstat = ATA_ERR | ATA_DF;
 		dh->ata.errfeat = ATA_UNC | ATA_ABORTED;
 	}
@@ -639,7 +692,7 @@ static struct sk_buff * ata(struct aoedev *d, struct sk_buff *skb)
 		offset = offset_in_page(dh->data);
 
 		if (bio_add_page(bio, page, bcnt, offset) < bcnt) {
-			printk(KERN_ERR "Can't bio_add_page for %d sectors\n", dh->ata.scnt);
+			eprintk(KERN_ERR "Can't bio_add_page for %d sectors\n", dh->ata.scnt);
 			bio_put(bio);
 			goto drop;
 		}
@@ -649,7 +702,7 @@ static struct sk_buff * ata(struct aoedev *d, struct sk_buff *skb)
 		submit_bio(rw, bio);
 		return NULL;
 	default:
-		printk(KERN_ERR "Unknown ATA command 0x%02X\n", dh->ata.cmdstat);
+		eprintk(KERN_ERR "Unknown ATA command 0x%02X\n", dh->ata.cmdstat);
 		dh->ata.cmdstat = ATA_ERR;
 		dh->ata.errfeat = ATA_ABORTED;
 		break;
@@ -727,46 +780,14 @@ drop:
 	return NULL;
 }
 
-static __always_inline char *treecmd_name(unsigned char cmd)
-{
-    switch (cmd) {
-    case AOECMD_CREATETREE:
-        return "AOECMD_CREATETREE";
-    case AOECMD_REMOVETREE:
-        return "AOECMD_REMOVETREE";
-    case AOECMD_READNODE:
-        return "AOECMD_READNODE";
-    case AOECMD_INSERTNODE:
-        return "AOECMD_INSERTNODE";
-    case AOECMD_UPDATENODE:
-        return "AOECMD_UPDATENODE";
-    case AOECMD_REMOVENODE:
-        return "AOECMD_REMOVENODE";
-    default:
-        return "UNKNOWN_TREE_CMD";
-    }
-}
+
 
 static __always_inline void set_errcode(struct aoe_datahdr *dh, int errcode)
 {
     memcpy(dh->data, &errcode, sizeof(int));
 }
 
-static void __dbg_print_treecmd(frame_direction_t dir, struct aoe_hdr *ah, struct aoe_datahdr *dh)
-{
-    printk(
-        "%s cmd(%u),tid(%llu),nid(%llu),off(%llu),len(%llu),err(%u) ", 
-        (dir == INCOMING ? "=>" : "<="), ah->cmd, dh->tree.tid, dh->tree.nid, 
-        dh->tree.off, dh->tree.len, dh->tree.err
-    );
-    if (ah->cmd == AOECMD_UPDATENODE && dir == INCOMING) {
-        printk("[%s]\n", dh->data);
-    } else if (ah->cmd == AOECMD_READNODE && dir == OUTGOING) {
-        printk("[%s]\n", dh->data);
-    } else {
-        printk("\n");
-    }
-}
+
 static struct sk_buff *treecmd(struct aoedev *d, struct sk_buff *skb)
 {
     struct aoe_hdr *ah;
@@ -776,7 +797,7 @@ static struct sk_buff *treecmd(struct aoedev *d, struct sk_buff *skb)
     ah = (struct aoe_hdr *) skb_mac_header(skb);
 	dh = (struct aoe_datahdr *) ah->data;
 
-    __dbg_print_treecmd(INCOMING,ah,dh);
+    /*__dbg_print_treecmd(INCOMING,ah,dh);*/
 
     switch(ah->cmd) {
     case AOECMD_CREATETREE:
@@ -795,7 +816,12 @@ static struct sk_buff *treecmd(struct aoedev *d, struct sk_buff *skb)
         skb_trim(skb, sizeof(*ah) + sizeof(*dh));
         break;
     case AOECMD_UPDATENODE:
+        pdbg("AOECMD_UPDATENODE: writing %llu bytes of data at offset(%llu)\n", dh->tree.len, dh->tree.off);
         dh->tree.err = clydefscore_node_write(dh->tree.tid, dh->tree.nid, dh->tree.off, dh->tree.len, dh->data);
+        pdbg("data written:\n");
+#ifdef DEBUGGING
+        print_hex_dump(KERN_EMERG, "", DUMP_PREFIX_NONE, 16, 1, dh->data, dh->tree.len, 0);
+#endif
         skb_trim(skb, sizeof(*ah)+sizeof(*dh));
         break;
     case AOECMD_INSERTNODE:
@@ -803,8 +829,10 @@ static struct sk_buff *treecmd(struct aoedev *d, struct sk_buff *skb)
         skb_trim(skb, sizeof(*ah) + sizeof(*dh));
         break;
     case AOECMD_READNODE:
+        pdbg("AOECMD_READNODE: reading %llu(uint:%u) bytes of data at offset(%llu)\n", dh->tree.len, (dh->tree.len & 0xFFFFFFFF), dh->tree.off);
         dh->tree.err = clydefscore_node_read(dh->tree.tid, dh->tree.nid, dh->tree.off, dh->tree.len, dh->data);
         if (unlikely(dh->tree.err)) {
+            pdbg("\t\t AOECMD_READNODE err'ed out!\n");
             skb_trim(skb, sizeof(*ah) + sizeof(*dh)); /*no additional data on error*/
         } else {
             /*dh->tree.len -- cannot use u64 across our ethernet interface 
@@ -820,7 +848,7 @@ static struct sk_buff *treecmd(struct aoedev *d, struct sk_buff *skb)
         pr_alert("UNKNOWN TREE CMD SENT, CODE: (%u)\n", ah->cmd);
         return NULL; /*FIXME: always dropping now*/
     }
-    __dbg_print_treecmd(OUTGOING, ah, dh);
+    /*__dbg_print_treecmd(OUTGOING, ah, dh);*/
     
     return skb;
 }
@@ -913,7 +941,7 @@ static void ktrcv(struct sk_buff *skb)
         case AOECMD_INSERTNODE:
         case AOECMD_UPDATENODE:
         case AOECMD_REMOVENODE:
-            printk(KERN_INFO "Received vendor-specific cmd: %u\n", aoe->cmd);
+            pdbg(KERN_INFO "Received vendor-specific cmd: %u\n", aoe->cmd);
             rskb = treecmd(d,rskb);
             break;
 		default:
