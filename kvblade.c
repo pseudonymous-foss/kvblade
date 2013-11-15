@@ -29,6 +29,15 @@ struct aoedev;
 #define wprintk(fmt, arg...) xprintk(KERN_WARN, fmt, ## arg)
 #define dprintk(fmt, arg...) if(0);else xprintk(KERN_DEBUG, fmt, ## arg)
 
+struct tree_work {
+    struct work_struct work;
+    struct aoedev *d;
+    struct sk_buff *rskb;
+};
+
+static struct workqueue_struct *tree_wq = NULL;
+static struct kmem_cache *tw_pool = NULL;
+
 //#define DEBUGGING 0
 
 #ifdef DEBUGGING
@@ -128,6 +137,48 @@ static struct aoedev *devlist;
 static struct completion ktrendez;
 static struct task_struct *task;
 static wait_queue_head_t ktwaitq;
+
+static struct sk_buff *treecmd(struct aoedev *d, struct sk_buff *skb);
+
+/** 
+ * Processes the actual work request and manipulates the 
+ * backend. 
+ * @param w the work structure containing the request 
+ *  
+ */ 
+static void do_tree_work(struct work_struct *w)
+{
+    struct sk_buff *rskb;
+    struct tree_work *tw = container_of(w, struct tree_work, work);
+
+    rskb = treecmd(tw->d, tw->rskb);
+
+    if (unlikely(!rskb)) {
+        printk("do_tree_work: treecmd(d,rskb) failed\n");
+        kmem_cache_free(tw_pool, tw);
+        return; /*err*/
+    }
+
+    atomic_dec(&tw->d->busy);
+
+    kmem_cache_free(tw_pool,tw);
+    skb_queue_tail(&skb_outq, rskb);
+    wake_up(&ktwaitq);
+}
+
+/** 
+ * Initialise the work structure before first use.
+ * @param data a reference to the work struct to initialise 
+ * @note as all tree_work items go to the same queue, 
+ *       initialising a tree_work struct just once suffices.
+ * @note subsequent calls re-using the work structure should 
+ *       call PREPARE_WORK()
+ */ 
+static void tree_work_init_once(void *data)
+{
+	struct tree_work *w = data;
+	INIT_WORK(&w->work, do_tree_work);
+}
 
 static struct kobj_type kvblade_ktype;
 
@@ -904,12 +955,14 @@ static __always_inline int is_tree_cmd(unsigned char cmd)
     return (cmd >= AOECMD_CREATETREE) && (cmd <= AOECMD_REMOVENODE);
 }
 
+
 static void ktrcv(struct sk_buff *skb)
 {
 	struct sk_buff *rskb;
 	struct aoedev *d;
 	struct aoe_hdr *aoe;
 	int major, minor;
+    struct tree_work *tw;
 
 	aoe = (struct aoe_hdr *) skb_mac_header(skb);
 	major = be16_to_cpu(aoe->major);
@@ -942,7 +995,21 @@ static void ktrcv(struct sk_buff *skb)
         case AOECMD_UPDATENODE:
         case AOECMD_REMOVENODE:
             pdbg(KERN_INFO "Received vendor-specific cmd: %u\n", aoe->cmd);
-            rskb = treecmd(d,rskb);
+            tw = kmem_cache_alloc(tw_pool, GFP_ATOMIC);
+            if (!tw) {
+                printk("failed to allocate tree_work\n");
+                dev_kfree_skb(rskb);
+                break;            
+            } else {
+                tw->rskb = rskb;
+                tw->d = d;
+                PREPARE_WORK(&tw->work, do_tree_work);
+                rskb = NULL; /*nothing to return presently, async OP*/
+                atomic_inc(&tw->d->busy);
+                queue_work(tree_wq, &tw->work);
+            }
+            
+            
             break;
 		default:
 			dev_kfree_skb(rskb);
@@ -1000,11 +1067,35 @@ static int __init kvblade_module_init(void)
 {
 	skb_queue_head_init(&skb_outq);
 	skb_queue_head_init(&skb_inq);
+    
 	
 	spin_lock_init(&lock);
 	
 	init_completion(&ktrendez);
 	init_waitqueue_head(&ktwaitq);
+
+    tree_wq = alloc_workqueue("kvblade_treewq", 
+                  WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+    if (!tree_wq) {
+        return -ENOMEM;
+    }
+
+    tw_pool = kmem_cache_create(
+        "kvblade_tw_pool",
+		sizeof(struct tree_work),
+        0,
+        /*objects are reclaimable*/
+		SLAB_RECLAIM_ACCOUNT 
+        /*spread allocation across memory rather than favouring memory local to current cpu*/
+         | SLAB_MEM_SPREAD,  
+        /*called whenever new pages are added to the cache*/
+		tree_work_init_once
+    );
+	if (!tw_pool) {
+        pr_debug("Failed to allocate a memcache for tree work items\n");
+        destroy_workqueue(tree_wq);
+		return -ENOMEM;
+    }
 	
 	task = kthread_run(kthread, NULL, "kvblade");
 	if (task == NULL || IS_ERR(task))
@@ -1024,6 +1115,10 @@ static __exit void kvblade_module_exit(void)
 	struct aoedev *d, *nd;
 
 	printk("Testing exiting\n");
+
+    /*Finish outstanding work -- TODO - how does ata_io_complete fare in this regard*/
+    flush_workqueue(tree_wq);
+
 	dev_remove_pack(&pt);
 	spin_lock(&lock);
 	d = devlist;
@@ -1045,6 +1140,10 @@ static __exit void kvblade_module_exit(void)
 	
 	kobject_del(&kvblade_kobj);
 	kobject_put(&kvblade_kobj);
+    
+    destroy_workqueue(tree_wq);
+    kmem_cache_destroy(tw_pool);
+    
 }
 
 module_init(kvblade_module_init);
