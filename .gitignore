@@ -1,0 +1,8 @@
+*.o.cmd
+.tmp_versions
+*.ko
+*.mod.*
+*.o
+modules.order
+Module.symvers
+.kvblade.ko.cmd

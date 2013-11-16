@@ -1075,7 +1075,7 @@ static int __init kvblade_module_init(void)
 	init_waitqueue_head(&ktwaitq);
 
     tree_wq = alloc_workqueue("kvblade_treewq", 
-                  WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+                  WQ_HIGHPRI | WQ_CPU_INTENSIVE, 256);
     if (!tree_wq) {
         return -ENOMEM;
     }
