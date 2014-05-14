@@ -14,6 +14,7 @@
 #include <linux/ctype.h>
 #include <linux/kern_levels.h>
 #include <linux/tree.h>
+#include <linux/delay.h>
 #include "if_aoe.h"
 #include "clydeinterface.h"
 
@@ -37,6 +38,33 @@ struct tree_work {
 
 static struct workqueue_struct *tree_wq = NULL;
 static struct kmem_cache *tw_pool = NULL;
+
+struct counter {
+    /*rollover every 1k*/
+    unsigned long count;
+    /*incremented at every rollover*/
+    unsigned long kcount;
+};
+
+struct counter mycounter;
+
+static __always_inline void count_inc(struct counter *c)
+{
+    if ( unlikely(++c->count == 1000) ){
+        c->count = 0;
+        c->kcount++;
+    }
+}
+
+static struct timer_list tmr;
+static void tmr_cb(unsigned long data) {
+    printk("kvblade (inc packets): %luk, %lu\n", mycounter.kcount, mycounter.count);
+    /*restart in 10 secs*/
+    if ( mod_timer(&tmr, jiffies + msecs_to_jiffies(10000)) ) {
+        printk("error initialising timer (mod_timer)\n");
+    }
+}
+
 
 //#define DEBUGGING 0
 
@@ -82,9 +110,6 @@ static struct kmem_cache *tw_pool = NULL;
 	static __always_inline char *treecmd_name(unsigned char cmd) {
 		return "";
 	}
-
-	static void __dbg_print_treecmd(frame_direction_t dir, struct aoe_hdr *ah, struct aoe_datahdr *dh)
-	{}
 
 	#define pdbg(fmt, arg...) {}
 #endif
@@ -976,6 +1001,7 @@ static void ktrcv(struct sk_buff *skb)
 			(skb->dev != d->netdev))
 			continue;
 
+        count_inc(&mycounter);
 		rskb = make_response(skb, d->major, d->minor);
 		if (rskb == NULL)
 			continue;
@@ -1073,6 +1099,10 @@ static int __init kvblade_module_init(void)
 	
 	init_completion(&ktrendez);
 	init_waitqueue_head(&ktwaitq);
+    setup_timer( &tmr, tmr_cb, 0 );
+    if ( mod_timer(&tmr, jiffies + msecs_to_jiffies(10000)) ) {
+        printk("error initialising timer (mod_timer)\n");
+    }
 
     tree_wq = alloc_workqueue("kvblade_treewq", 
                   WQ_HIGHPRI | WQ_CPU_INTENSIVE, 256);
@@ -1115,6 +1145,10 @@ static __exit void kvblade_module_exit(void)
 	struct aoedev *d, *nd;
 
 	printk("Testing exiting\n");
+    while ( del_timer(&tmr) ) {
+        printk("waiting for timer...\n");
+        msleep(3000);
+    }
 
     /*Finish outstanding work -- TODO - how does ata_io_complete fare in this regard*/
     flush_workqueue(tree_wq);
